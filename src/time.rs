@@ -18,6 +18,7 @@ pub fn precise_of(dt: OffsetDateTime) -> Box<str> {
     format::<true>(dt)
 }
 
+#[allow(clippy::uninit_vec)]
 fn format<const MICRO: bool>(dt: OffsetDateTime) -> Box<str> {
     let dt = dt.to_offset(UtcOffset::from_whole_seconds(8 * 3600).unwrap());
     let len = 16 + if MICRO { 5 } else { 0 };
