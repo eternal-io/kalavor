@@ -1,3 +1,2 @@
-mod datetime;
-
-pub use datetime::Katetime;
+#[cfg(feature = "time")]
+pub mod time;

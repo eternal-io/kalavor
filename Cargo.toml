@@ -2,20 +2,21 @@
 name = "kalavor"
 version = "0.1.0"
 edition = "2021"
-authors = ["K--A"]
+authors = ["K--Aethiax"]
 
-description = "K--A flavored contents."
+description = "K--Aethiax flavored contents, mainly for private use."
 
 documentation = "https://docs.rs/kalavor"
 repository = "https://github.com/eternal-io/kalavor"
 license = "MIT OR Apache-2.0"
 readme = false
 
-keywords = ["KA", "flavored", "content"]
+keywords = ["flavored", "content"]
 categories = ["value-formatting", "text-processing"]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+default = []
+time = []
 
 [dependencies]
-chrono = "0.4.24"
-radix_fmt = "1.0.0"
+time = { version = "0.3.37", default-features = false, features = ["std"] }
