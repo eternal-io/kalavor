@@ -1,8 +1,20 @@
 use simdutf8::compat::from_utf8;
 use std::{
     io::{Error, ErrorKind, Read, Result},
+    ops::RangeBounds,
     ptr,
+    result::Result as StdResult,
 };
+
+/// Helper function that negatives a `predicate`.
+pub const fn not(mut predicate: impl 'static + FnMut(char) -> bool) -> impl 'static + FnMut(char) -> bool {
+    move |ch| !predicate(ch)
+}
+
+/// Helper function used with e.g. [`char::is_ascii`].
+pub const fn by_ref(mut predicate: impl 'static + FnMut(&char) -> bool) -> impl 'static + FnMut(char) -> bool {
+    move |ch| predicate(&ch)
+}
 
 pub struct Utf8Reader<R: Read> {
     src: R,
@@ -13,8 +25,8 @@ pub struct Utf8Reader<R: Read> {
     off_consumed: usize,
     off_valid: usize,
     off_raw: usize,
-    peeked: bool,
-    eoff: bool,
+    peeked: Option<u8>,
+    eof: bool,
 }
 
 impl<R: Read> Utf8Reader<R> {
@@ -38,19 +50,9 @@ impl<R: Read> Utf8Reader<R> {
             off_consumed: 0,
             off_valid: 0,
             off_raw: 0,
-            peeked: false,
-            eoff: false,
+            peeked: None,
+            eof: false,
         }
-    }
-
-    /// Returns `true` if encountered the EOF and all bytes are consumed.
-    pub fn eof(&self) -> bool {
-        self.eoff && self.off_consumed == self.off_valid
-    }
-
-    /// Returns the count of totally consumed bytes.
-    pub fn consumed(&self) -> usize {
-        self.tot_consumed + self.off_consumed
     }
 
     /// Returns the string of unconsumed, valid UTF-8 bytes.
@@ -65,8 +67,6 @@ impl<R: Read> Utf8Reader<R> {
     ///
     /// Panics if the `n`th byte is not at a UTF-8 character boundary.
     pub fn consume(&mut self, n: usize) {
-        self.peeked = false;
-
         if !self.content().is_char_boundary(n) {
             panic!("{} is not at a UTF-8 character boundary", n)
         }
@@ -74,161 +74,21 @@ impl<R: Read> Utf8Reader<R> {
         self.off_consumed += n;
     }
 
-    /// Returns the first character of the content, then consumes it.
-    ///
-    /// This method will automatically [`pull`](Self::pull) if the content is empty.
-    #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Result<Option<char>> {
-        self.peeked = false;
-
-        if self.content().is_empty() {
-            self.pull()?;
-        }
-
-        Ok(self.content().chars().next().inspect(|ch| {
-            self.off_consumed += ch.len_utf8();
-        }))
+    /// Returns the count of totally consumed bytes.
+    pub fn consumed(&self) -> usize {
+        self.tot_consumed + self.off_consumed
     }
 
-    /// Returns the first character of the content.
-    ///
-    /// This method will automatically [`pull`](Self::pull) if the content is empty.
-    pub fn peek(&mut self) -> Result<Option<char>> {
-        if self.content().is_empty() {
-            self.pull()?;
-        }
-
-        self.peeked = true;
-
-        Ok(self.content().chars().next())
+    /// Returns `true` if encountered the EOF and all bytes are consumed.
+    pub fn exhausted(&self) -> bool {
+        self.eof && self.off_consumed == self.off_valid
     }
 
-    /// Returns the first character of the content, consumes it if the previous call is still
-    /// [`peek`](Self::peek), [`peeking`](Self::peeking) or [`peeking_more`](Self::peeking_more).
+    //------------------------------------------------------------------------------
+
+    /// Pulls no more than [`INIT_CAP`](Self::INIT_CAP) bytes.
     ///
-    /// The continuous state would be broken by the call of [`next`](Self::next) or [`consume`](Self::consume).
-    ///
-    /// This method will automatically [`pull`](Self::pull) if the content is empty.
-    pub fn peeking(&mut self) -> Result<Option<char>> {
-        if self.content().is_empty() {
-            self.pull()?;
-        }
-
-        let opt = self.content().chars().next().inspect(|ch| {
-            if self.peeked {
-                self.off_consumed += ch.len_utf8();
-            }
-        });
-
-        self.peeked = true;
-
-        Ok(opt)
-    }
-
-    /// Returns the first character of the content, consumes it if the previous call is still
-    /// [`peek`](Self::peek), [`peeking`](Self::peeking) or [`peeking_more`](Self::peeking_more).
-    ///
-    /// The continuous state would be broken by the call of [`next`](Self::next) or [`consume`](Self::consume).
-    ///
-    /// This method will automatically [`pull_more`](Self::pull_more) if the content is insufficient.
-    ///
-    /// **Private method because `off_consumed` is invisible.**
-    #[inline(always)]
-    fn peeking_more(&mut self) -> Result<Option<char>> {
-        if self.content().is_empty() {
-            self.pull_more()?;
-        }
-
-        let opt = self.content().chars().next().inspect(|ch| {
-            if self.peeked {
-                self.off_consumed += ch.len_utf8();
-            }
-        });
-
-        self.peeked = true;
-
-        Ok(opt)
-    }
-
-    /// Scans a piece of content consisting of `predicate`.
-    ///
-    /// Returns the first unexpected character additionally, may be `None` if encountered the EOF.
-    ///
-    /// This method will automatically [`pull_more`](Self::pull_more) if the content is insufficient.
-    pub fn scan(&mut self, predicate: impl Fn(char) -> bool) -> Result<(&str, Option<char>)> {
-        let start = self.off_consumed;
-        let ch = loop {
-            if let Some(ch) = self.peeking_more()? {
-                if !predicate(ch) {
-                    break Some(ch);
-                }
-            } else {
-                break None;
-            }
-        };
-
-        Ok((
-            unsafe { core::str::from_utf8_unchecked(self.buf.get_unchecked(start..self.off_consumed)) },
-            ch,
-        ))
-    }
-
-    /// Scans a piece of content ends with `terminator`. The `terminator` is excluded from the result and marked as consumed.
-    ///
-    /// Returns `Ok(Err(&str))` if encountered the EOF.
-    ///
-    /// This method will automatically [`pull_more`](Self::pull_more) if the content is insufficient.
-    pub fn scan_until(&mut self, terminator: &str) -> Result<std::result::Result<&str, &str>> {
-        let start = self.off_consumed;
-        let indicator = terminator.as_bytes()[0];
-
-        'outer: loop {
-            loop {
-                let content = unsafe { self.buf.get_unchecked(self.off_consumed..self.off_valid) };
-                match content.iter().position(|b| *b == indicator) {
-                    None if self.eoff => {
-                        break 'outer;
-                    }
-                    None => {
-                        self.off_consumed += content.len();
-                        self.pull_more()?;
-                    }
-                    Some(idx) => {
-                        self.off_consumed += idx;
-                        break;
-                    }
-                }
-            }
-
-            if !self.pull_at_least(terminator.len())? {
-                break 'outer;
-            }
-
-            if unsafe {
-                self.buf
-                    .get_unchecked(self.off_consumed..)
-                    .get_unchecked(..terminator.len())
-                    == terminator.as_bytes()
-            } {
-                let span = unsafe { core::str::from_utf8_unchecked(self.buf.get_unchecked(start..self.off_consumed)) };
-
-                self.off_consumed += terminator.len();
-
-                return Ok(Ok(span));
-            }
-        }
-
-        self.off_consumed = self.off_valid;
-
-        Ok(Err(unsafe {
-            core::str::from_utf8_unchecked(self.buf.get_unchecked(start..self.off_consumed))
-        }))
-    }
-
-    /// Pulls no more than [`Self::INIT_CAP`] bytes.
-    /*
-        NOTE: Contents MAY be moved.
-    */
+    /*  NOTE: The content may NOT be pinned. */
     pub fn pull(&mut self) -> Result<()> {
         if self.off_raw - self.off_consumed > Self::INIT_CAP {
             return Ok(());
@@ -258,10 +118,9 @@ impl<R: Read> Utf8Reader<R> {
         self.fetch(Self::pull)
     }
 
-    /// Pulls more bytes, allowing the content to grow infinitely but slowly (at most [`Self::GROW_CAP`] bytes for each call).
-    /*
-        NOTE: Contents would NOT be moved.
-    */
+    /// Pulls more bytes, allows the content to grow infinitely (at most [`GROW_CAP`](Self::GROW_CAP) bytes each call).
+    ///
+    /*  NOTE: The content would be pinned. */
     pub fn pull_more(&mut self) -> Result<()> {
         if self.buf_cap - self.off_raw < Self::THRES_EXTEND {
             self.buf.reserve(Self::GROW_CAP);
@@ -275,14 +134,13 @@ impl<R: Read> Utf8Reader<R> {
     /// Pulls more bytes, makes the content has at least `n` bytes.
     ///
     /// Returns `Ok(false)` if encountered the EOF, indicates that unable to read such more bytes.
-    /*
-        NOTE: Contents would NOT be moved.
-    */
+    ///
+    /*  NOTE: The content would be pinned.  */
     pub fn pull_at_least(&mut self, n: usize) -> Result<bool> {
         loop {
             match self.content().len() < n {
                 false => return Ok(true),
-                true => match !self.eoff {
+                true => match !self.eof {
                     false => return Ok(false),
                     true => self.pull_more()?,
                 },
@@ -293,9 +151,9 @@ impl<R: Read> Utf8Reader<R> {
     fn fetch(&mut self, rerun: fn(&mut Self) -> Result<()>) -> Result<()> {
         let len = unsafe { self.src.read(self.buf.get_unchecked_mut(self.off_raw..self.buf_cap))? };
 
-        self.eoff = len == 0;
+        self.eof = len == 0;
 
-        if !self.eoff {
+        if !self.eof {
             self.off_raw += len;
             self.tot_read += len;
 
@@ -328,5 +186,230 @@ impl<R: Read> Utf8Reader<R> {
         self.off_valid += valid_len;
 
         Ok(valid_len)
+    }
+
+    //------------------------------------------------------------------------------
+
+    /// Consumes one character.
+    ///
+    /// This method will automatically [`pull`](Self::pull) if the content is empty.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<Option<char>> {
+        if self.content().is_empty() {
+            self.pull()?;
+        }
+
+        Ok(self.content().chars().next().inspect(|ch| {
+            self.off_consumed += ch.len_utf8();
+        }))
+    }
+
+    /// Same as [`next`](Self::next) but [`pull_more`](Self::pull_more) instead.
+    ///
+    /// Private method because opaque and unpinned internal offsets.
+    #[inline(always)]
+    fn next_more(&mut self) -> Result<Option<char>> {
+        if self.content().is_empty() {
+            self.pull_more()?;
+        }
+
+        Ok(self.content().chars().next().inspect(|ch| {
+            self.off_consumed += ch.len_utf8();
+        }))
+    }
+
+    /// Peeks one character.
+    ///
+    /// This method will automatically [`pull`](Self::pull) if the content is empty.
+    pub fn peek(&mut self) -> Result<Option<char>> {
+        if self.content().is_empty() {
+            self.pull()?;
+        }
+
+        Ok(self.content().chars().next())
+    }
+
+    /// Consumes one character then peeks the second if the previous call is still [`peek_more`](Self::peek_more),
+    /// peeks one character otherwise.
+    ///
+    /// This method will automatically [`pull_more`](Self::pull_more) if the content is insufficient.
+    ///
+    /// NOTE: Needs manually let `self.peeked = None`.
+    ///
+    /// Private method because opaque and unpinned internal offsets.
+    #[inline(always)]
+    fn peek_more(&mut self) -> Result<Option<char>> {
+        if let Some(len) = self.peeked.take() {
+            self.off_consumed += len as usize;
+        }
+
+        if self.content().is_empty() {
+            self.pull_more()?;
+        }
+
+        Ok(self.content().chars().next().inspect(|ch| {
+            self.peeked = Some(ch.len_utf8() as u8);
+        }))
+    }
+
+    //------------------------------------------------------------------------------
+
+    /// Consumes one character if `predicate`.
+    ///
+    /// This method will automatically [`pull`](Self::pull) if the content is empty.
+    pub fn take_once<P>(&mut self, mut predicate: P) -> Result<Option<char>>
+    where
+        P: FnMut(char) -> bool,
+    {
+        if let Some(ch) = self.peek()? {
+            if predicate(ch) {
+                return Ok(Some(ch));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Consumes N..M characters consisting of `predicate`.
+    ///
+    /// Peeks the first unexpected character additionally, may be `None` if encountered the EOF.
+    ///
+    /// Returns `Ok(Err(&str))` and TODO: doesn't consume if the taking times not in `range`.
+    ///
+    /// This method will automatically [`pull_more`](Self::pull_more) if the content is insufficient.
+    pub fn take_times<P, N>(&mut self, mut predicate: P, range: N) -> Result<(StdResult<&str, &str>, Option<char>)>
+    where
+        P: FnMut(char) -> bool,
+        N: RangeBounds<usize>,
+    {
+        self.peeked = None;
+
+        todo!()
+    }
+
+    /// Consumes X characters consisting of `predicate`.
+    ///
+    /// Peeks the first unexpected character additionally, may be `None` if encountered the EOF.
+    ///
+    /// This method will automatically [`pull_more`](Self::pull_more) if the content is insufficient.
+    pub fn take_while<P>(&mut self, mut predicate: P) -> Result<(&str, Option<char>)>
+    where
+        P: FnMut(char) -> bool,
+    {
+        self.peeked = None;
+
+        let start = self.off_consumed;
+        let ch = loop {
+            if let Some(ch) = self.peek_more()? {
+                if !predicate(ch) {
+                    break Some(ch);
+                }
+            } else {
+                break None;
+            }
+        };
+
+        Ok((
+            unsafe { core::str::from_utf8_unchecked(self.buf.get_unchecked(start..self.off_consumed)) },
+            ch,
+        ))
+    }
+
+    /// Consumes N characters that equals `pattern`.
+    ///
+    /// Returns `Ok(false)` and doesn't consume if did't match or encountered the EOF.
+    ///
+    /// This method will automatically [`pull_more`](Self::pull_more) if the content is insufficient.
+    pub fn matches(&mut self, pattern: &str) -> Result<bool> {
+        if !self.pull_at_least(pattern.len())? {
+            return Ok(false);
+        }
+
+        if unsafe {
+            self.buf
+                .get_unchecked(self.off_consumed..)
+                .get_unchecked(..pattern.len())
+        } != pattern.as_bytes()
+        {
+            return Ok(false);
+        }
+
+        self.off_consumed += pattern.len();
+
+        Ok(true)
+    }
+
+    /// Consumes X characters until encountered `terminator`.
+    ///
+    /// The `terminator` is excluded from the result and also marked as consumed.
+    ///
+    /// Returns `Ok(Err(&str))` and TODO: doesn't consume if encountered the EOF.
+    ///
+    /// This method will automatically [`pull_more`](Self::pull_more) if the content is insufficient.
+    pub fn until(&mut self, terminator: &str) -> Result<StdResult<&str, &str>> {
+        let start = self.off_consumed;
+        let indicator = terminator.as_bytes()[0];
+
+        'outer: loop {
+            loop {
+                let content = unsafe { self.buf.get_unchecked(self.off_consumed..self.off_valid) };
+                match content.iter().position(|b| *b == indicator) {
+                    None if self.eof => {
+                        break 'outer;
+                    }
+                    None => {
+                        self.off_consumed += content.len();
+                        self.pull_more()?;
+                    }
+                    Some(idx) => {
+                        self.off_consumed += idx;
+                        break;
+                    }
+                }
+            }
+
+            if !self.pull_at_least(terminator.len())? {
+                break 'outer;
+            }
+
+            if unsafe {
+                self.buf
+                    .get_unchecked(self.off_consumed..)
+                    .get_unchecked(..terminator.len())
+            } == terminator.as_bytes()
+            {
+                let span = unsafe { core::str::from_utf8_unchecked(self.buf.get_unchecked(start..self.off_consumed)) };
+
+                self.off_consumed += terminator.len();
+
+                return Ok(Ok(span));
+            }
+        }
+
+        self.off_consumed = self.off_valid;
+
+        Ok(Err(unsafe {
+            core::str::from_utf8_unchecked(self.buf.get_unchecked(start..self.off_consumed))
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan() -> Result<()> {
+        let msg = " >< Foo >< Bar >< Baz >< ";
+        let mut rdr = Utf8Reader::new(msg.as_bytes());
+
+        let separator = |ch| matches!(ch, ' ' | '>' | '<');
+
+        assert_eq!(rdr.take_while(separator)?, (" >< ", Some('F')));
+        assert_eq!(rdr.take_while(by_ref(char::is_ascii_alphabetic))?, ("Foo", Some(' ')));
+
+        assert_eq!(rdr.take_while(not(separator))?, ("", Some(' ')));
+
+        Ok(())
     }
 }
