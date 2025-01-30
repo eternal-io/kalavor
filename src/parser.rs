@@ -6,15 +6,10 @@ use std::{
     result::Result as StdResult,
 };
 
-/// Helper function that negatives a `predicate`.
-pub const fn not(mut predicate: impl 'static + FnMut(char) -> bool) -> impl 'static + FnMut(char) -> bool {
-    move |ch| !predicate(ch)
-}
+#[macro_use]
+pub mod predicates;
 
-/// Helper function used with e.g. [`char::is_ascii`].
-pub const fn by_ref(mut predicate: impl 'static + FnMut(&char) -> bool) -> impl 'static + FnMut(char) -> bool {
-    move |ch| predicate(&ch)
-}
+pub use predicates::*;
 
 pub struct Utf8Reader<R: Read> {
     src: R,
@@ -204,20 +199,6 @@ impl<R: Read> Utf8Reader<R> {
         }))
     }
 
-    /// Same as [`next`](Self::next) but [`pull_more`](Self::pull_more) instead.
-    ///
-    /// Private method because opaque and unpinned internal offsets.
-    #[inline(always)]
-    fn next_more(&mut self) -> Result<Option<char>> {
-        if self.content().is_empty() {
-            self.pull_more()?;
-        }
-
-        Ok(self.content().chars().next().inspect(|ch| {
-            self.off_consumed += ch.len_utf8();
-        }))
-    }
-
     /// Peeks one character.
     ///
     /// This method will automatically [`pull`](Self::pull) if the content is empty.
@@ -236,9 +217,9 @@ impl<R: Read> Utf8Reader<R> {
     ///
     /// NOTE: Needs manually let `self.peeked = None`.
     ///
-    /// Private method because opaque and unpinned internal offsets.
+    /** Private method because opaque and unpinned internal offsets. */
     #[inline(always)]
-    fn peek_more(&mut self) -> Result<Option<char>> {
+    fn peeking(&mut self) -> Result<Option<char>> {
         if let Some(len) = self.peeked.take() {
             self.off_consumed += len as usize;
         }
@@ -261,30 +242,54 @@ impl<R: Read> Utf8Reader<R> {
     where
         P: FnMut(char) -> bool,
     {
-        if let Some(ch) = self.peek()? {
-            if predicate(ch) {
-                return Ok(Some(ch));
-            }
-        }
-
-        Ok(None)
+        Ok(match self.peek()? {
+            None => None,
+            Some(ch) => match predicate(ch) {
+                false => None,
+                true => {
+                    self.off_consumed += ch.len_utf8();
+                    Some(ch)
+                }
+            },
+        })
     }
 
     /// Consumes N..M characters consisting of `predicate`.
     ///
     /// Peeks the first unexpected character additionally, may be `None` if encountered the EOF.
     ///
-    /// Returns `Ok(Err(&str))` and TODO: doesn't consume if the taking times not in `range`.
+    /// Returns `Ok((Err(&str), _))` and doesn't consume if the taking times not in `range`.
     ///
     /// This method will automatically [`pull_more`](Self::pull_more) if the content is insufficient.
-    pub fn take_times<P, N>(&mut self, mut predicate: P, range: N) -> Result<(StdResult<&str, &str>, Option<char>)>
+    pub fn take_times<P, T>(&mut self, mut predicate: P, range: T) -> Result<(StdResult<&str, &str>, Option<char>)>
     where
         P: FnMut(char) -> bool,
-        N: RangeBounds<usize>,
+        T: RangeBounds<usize>,
     {
         self.peeked = None;
 
-        todo!()
+        let mut times = 0;
+        let start = self.off_consumed;
+        let ch = loop {
+            match self.peeking()? {
+                None => break None,
+                Some(ch) => match range.contains(&(times + 1)) && predicate(ch) {
+                    false => break Some(ch),
+                    true => times += 1,
+                },
+            }
+        };
+
+        let span = unsafe { core::str::from_utf8_unchecked(self.buf.get_unchecked(start..self.off_consumed)) };
+
+        Ok((
+            range
+                .contains(&times)
+                .then_some(span)
+                .ok_or(span)
+                .inspect_err(|_| self.off_consumed = start),
+            ch,
+        ))
     }
 
     /// Consumes X characters consisting of `predicate`.
@@ -300,12 +305,12 @@ impl<R: Read> Utf8Reader<R> {
 
         let start = self.off_consumed;
         let ch = loop {
-            if let Some(ch) = self.peek_more()? {
-                if !predicate(ch) {
-                    break Some(ch);
-                }
-            } else {
-                break None;
+            match self.peeking()? {
+                None => break None,
+                Some(ch) => match predicate(ch) {
+                    false => break Some(ch),
+                    true => continue,
+                },
             }
         };
 
@@ -315,37 +320,38 @@ impl<R: Read> Utf8Reader<R> {
         ))
     }
 
-    /// Consumes N characters that equals `pattern`.
+    /// Consumes N characters that precedes `pattern`.
     ///
     /// Returns `Ok(false)` and doesn't consume if did't match or encountered the EOF.
     ///
     /// This method will automatically [`pull_more`](Self::pull_more) if the content is insufficient.
     pub fn matches(&mut self, pattern: &str) -> Result<bool> {
-        if !self.pull_at_least(pattern.len())? {
-            return Ok(false);
-        }
-
-        if unsafe {
+        Ok(if !self.pull_at_least(pattern.len())? {
+            false
+        } else if unsafe {
             self.buf
                 .get_unchecked(self.off_consumed..)
                 .get_unchecked(..pattern.len())
         } != pattern.as_bytes()
         {
-            return Ok(false);
-        }
-
-        self.off_consumed += pattern.len();
-
-        Ok(true)
+            false
+        } else {
+            self.off_consumed += pattern.len();
+            true
+        })
     }
 
     /// Consumes X characters until encountered `terminator`.
     ///
     /// The `terminator` is excluded from the result and also marked as consumed.
     ///
-    /// Returns `Ok(Err(&str))` and TODO: doesn't consume if encountered the EOF.
+    /// Returns `Ok(Err(&str))` and doesn't consume if encountered the EOF.
     ///
     /// This method will automatically [`pull_more`](Self::pull_more) if the content is insufficient.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `terminator` is empty.
     pub fn until(&mut self, terminator: &str) -> Result<StdResult<&str, &str>> {
         let start = self.off_consumed;
         let indicator = terminator.as_bytes()[0];
@@ -384,13 +390,15 @@ impl<R: Read> Utf8Reader<R> {
 
                 return Ok(Ok(span));
             }
+
+            self.off_consumed += 1;
         }
 
-        self.off_consumed = self.off_valid;
+        let span = unsafe { core::str::from_utf8_unchecked(self.buf.get_unchecked(start..self.off_valid)) };
 
-        Ok(Err(unsafe {
-            core::str::from_utf8_unchecked(self.buf.get_unchecked(start..self.off_consumed))
-        }))
+        self.off_consumed = start;
+
+        Ok(Err(span))
     }
 }
 
@@ -406,9 +414,12 @@ mod tests {
         let separator = |ch| matches!(ch, ' ' | '>' | '<');
 
         assert_eq!(rdr.take_while(separator)?, (" >< ", Some('F')));
-        assert_eq!(rdr.take_while(by_ref(char::is_ascii_alphabetic))?, ("Foo", Some(' ')));
+        assert_eq!(rdr.take_while(char::is_alphabetic)?, ("Foo", Some(' ')));
 
-        assert_eq!(rdr.take_while(not(separator))?, ("", Some(' ')));
+        assert_eq!(rdr.take_while(not!(separator))?, ("", Some(' ')));
+
+        assert_eq!(rdr.until("<>")?, Err(" >< Bar >< Baz >< "));
+        assert_eq!(rdr.until("Bar")?, Ok(" >< "));
 
         Ok(())
     }

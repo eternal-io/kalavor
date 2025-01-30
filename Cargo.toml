@@ -18,7 +18,9 @@ categories = ["value-formatting", "text-processing"]
 default = []
 time = ["dep:time"]
 parser = ["dep:simdutf8"]
+parser-unicode = ["parser", "dep:unicode-ident"]
 
 [dependencies]
 time = { version = "0.3.37", optional = true, default-features = false, features = ["std"] }
 simdutf8 = { version = "0.1.5", optional = true }
+unicode-ident = { version = "1.0.16", optional = true }
