@@ -7,7 +7,7 @@ use std::{
 };
 
 #[macro_use]
-pub mod predicates;
+mod predicates;
 
 pub use predicates::*;
 
@@ -128,7 +128,7 @@ impl<R: Read> Utf8Reader<R> {
 
     /// Pulls more bytes, makes the content has at least `n` bytes.
     ///
-    /// Returns `Ok(false)` if encountered the EOF, indicates that unable to read such more bytes.
+    /// Returns `Ok(false)` if encountered the EOF, unable to read such more bytes.
     ///
     /*  NOTE: The content would be pinned.  */
     pub fn pull_at_least(&mut self, n: usize) -> Result<bool> {
@@ -174,10 +174,11 @@ impl<R: Read> Utf8Reader<R> {
                 None => e.valid_up_to(),
                 Some(n) => Err(Error::new(
                     ErrorKind::InvalidData,
-                    format!("invalid UTF-8 bytes at slice {}+{}", self.tot_read, n),
+                    format!("invalid UTF-8 bytes at index {}+{}", self.tot_read, n),
                 ))?,
             },
         };
+
         self.off_valid += valid_len;
 
         Ok(valid_len)
@@ -325,75 +326,79 @@ impl<R: Read> Utf8Reader<R> {
         ))
     }
 
-    /// Consumes N characters that precedes `pattern`.
+    /// Consumes N characters if matched `pattern`.
     ///
-    /// Returns `Ok(false)` and doesn't consume if did't match or encountered the EOF.
+    /// Returns `Ok(None)` and doesn't consume if did't match anything.
     ///
-    /// This method will automatically [`pull_more`](Self::pull_more) if the content is insufficient.
-    pub fn matches(&mut self, pattern: &str) -> Result<bool> {
-        Ok(if !self.pull_at_least(pattern.len())? {
-            false
-        } else if unsafe {
-            self.buf
-                .get_unchecked(self.off_consumed..)
-                .get_unchecked(..pattern.len())
-        } != pattern.as_bytes()
-        {
-            false
-        } else {
-            self.off_consumed += pattern.len();
-            true
+    /// This method will automatically [`pull`](Self::pull) if the content is insufficient.
+    pub fn matches<P>(&mut self, pattern: P) -> Result<Option<P::Index>>
+    where
+        P: Pattern,
+    {
+        self.pull()?;
+
+        Ok(match self.buf.first() {
+            None => None,
+            Some(&b) => match pattern.indicate(b) {
+                None => None,
+                Some(len) => {
+                    self.pull_at_least(len)?;
+                    match pattern.matches(self.content()) {
+                        None => None,
+                        Some((len, idx)) => {
+                            self.off_consumed += len;
+                            Some(idx)
+                        }
+                    }
+                }
+            },
         })
     }
 
-    /// Consumes X characters until encountered `terminator`.
+    /// Consumes X characters until matched `pattern`.
     ///
-    /// The `terminator` is excluded from the result and also marked as consumed.
+    /// The `pattern` is excluded from the result and also marked as consumed.
     ///
     /// Returns `Ok(Err(&str))` and doesn't consume if encountered the EOF.
     ///
     /// This method will automatically [`pull_more`](Self::pull_more) if the content is insufficient.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `terminator` is empty.
-    pub fn until(&mut self, terminator: &str) -> Result<StdResult<&str, &str>> {
+    pub fn until<P>(&mut self, pattern: P) -> Result<StdResult<(&str, P::Index), &str>>
+    where
+        P: Pattern,
+    {
         let start = self.off_consumed;
-        let indicator = terminator.as_bytes()[0];
 
         'outer: loop {
-            loop {
-                let content = unsafe { self.buf.get_unchecked(self.off_consumed..self.off_valid) };
-                match content.iter().position(|b| *b == indicator) {
+            let len = loop {
+                match self
+                    .content()
+                    .as_bytes()
+                    .iter()
+                    .enumerate()
+                    .find_map(|(idx, &b)| pattern.indicate(b).map(|len| (idx, len)))
+                {
                     None if self.eof => {
                         break 'outer;
                     }
                     None => {
-                        self.off_consumed += content.len();
+                        self.off_consumed += self.content().len();
                         self.pull_more()?;
                     }
-                    Some(idx) => {
+                    Some((idx, len)) => {
                         self.off_consumed += idx;
-                        break;
+                        break len;
                     }
                 }
-            }
+            };
 
-            if !self.pull_at_least(terminator.len())? {
-                break 'outer;
-            }
+            self.pull_at_least(len)?;
 
-            if unsafe {
-                self.buf
-                    .get_unchecked(self.off_consumed..)
-                    .get_unchecked(..terminator.len())
-            } == terminator.as_bytes()
-            {
+            if let Some((len, idx)) = pattern.matches(self.content()) {
                 let span = unsafe { core::str::from_utf8_unchecked(self.buf.get_unchecked(start..self.off_consumed)) };
 
-                self.off_consumed += terminator.len();
+                self.off_consumed += len;
 
-                return Ok(Ok(span));
+                return Ok(Ok((span, idx)));
             }
 
             self.off_consumed += 1;
@@ -424,7 +429,7 @@ mod tests {
         assert_eq!(rdr.take_while(not!(separator))?, ("", Some(' ')));
 
         assert_eq!(rdr.until("<>")?, Err(" >< Bar >< Baz >< "));
-        assert_eq!(rdr.until("Bar")?, Ok(" >< "));
+        assert_eq!(rdr.until(["Foo", "Bar"])?, Ok((" >< ", 1)));
 
         Ok(())
     }
