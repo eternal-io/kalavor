@@ -1,7 +1,7 @@
 use simdutf8::compat::from_utf8;
 use std::{
     io::{Error, ErrorKind, Read, Result},
-    ops::RangeBounds,
+    ops::{Bound, RangeBounds},
     ptr,
     result::Result as StdResult,
 };
@@ -238,13 +238,13 @@ impl<R: Read> Utf8Reader<R> {
     /// Consumes one character if `predicate`.
     ///
     /// This method will automatically [`pull`](Self::pull) if the content is empty.
-    pub fn take_once<P>(&mut self, mut predicate: P) -> Result<Option<char>>
+    pub fn take_once<P>(&mut self, predicate: P) -> Result<Option<char>>
     where
-        P: FnMut(char) -> bool,
+        P: Predicate,
     {
         Ok(match self.peek()? {
             None => None,
-            Some(ch) => match predicate(ch) {
+            Some(ch) => match predicate.predicate(ch) {
                 false => None,
                 true => {
                     self.off_consumed += ch.len_utf8();
@@ -261,10 +261,10 @@ impl<R: Read> Utf8Reader<R> {
     /// Returns `Ok((Err(&str), _))` and doesn't consume if the taking times not in `range`.
     ///
     /// This method will automatically [`pull_more`](Self::pull_more) if the content is insufficient.
-    pub fn take_times<P, T>(&mut self, mut predicate: P, range: T) -> Result<(StdResult<&str, &str>, Option<char>)>
+    pub fn take_times<P, U>(&mut self, predicate: P, range: U) -> Result<(StdResult<&str, &str>, Option<char>)>
     where
-        P: FnMut(char) -> bool,
-        T: RangeBounds<usize>,
+        P: Predicate,
+        U: RangeBounds<usize>,
     {
         self.peeked = None;
 
@@ -273,7 +273,12 @@ impl<R: Read> Utf8Reader<R> {
         let ch = loop {
             match self.peeking()? {
                 None => break None,
-                Some(ch) => match range.contains(&(times + 1)) && predicate(ch) {
+                Some(ch) => match match range.end_bound() {
+                    Bound::Included(&n) => times <= n,
+                    Bound::Excluded(&n) => times < n,
+                    Bound::Unbounded => true,
+                } && predicate.predicate(ch)
+                {
                     false => break Some(ch),
                     true => times += 1,
                 },
@@ -297,9 +302,9 @@ impl<R: Read> Utf8Reader<R> {
     /// Peeks the first unexpected character additionally, may be `None` if encountered the EOF.
     ///
     /// This method will automatically [`pull_more`](Self::pull_more) if the content is insufficient.
-    pub fn take_while<P>(&mut self, mut predicate: P) -> Result<(&str, Option<char>)>
+    pub fn take_while<P>(&mut self, predicate: P) -> Result<(&str, Option<char>)>
     where
-        P: FnMut(char) -> bool,
+        P: Predicate,
     {
         self.peeked = None;
 
@@ -307,7 +312,7 @@ impl<R: Read> Utf8Reader<R> {
         let ch = loop {
             match self.peeking()? {
                 None => break None,
-                Some(ch) => match predicate(ch) {
+                Some(ch) => match predicate.predicate(ch) {
                     false => break Some(ch),
                     true => continue,
                 },
@@ -414,7 +419,7 @@ mod tests {
         let separator = |ch| matches!(ch, ' ' | '>' | '<');
 
         assert_eq!(rdr.take_while(separator)?, (" >< ", Some('F')));
-        assert_eq!(rdr.take_while(char::is_alphabetic)?, ("Foo", Some(' ')));
+        assert_eq!(rdr.take_while(alphabetic)?, ("Foo", Some(' ')));
 
         assert_eq!(rdr.take_while(not!(separator))?, ("", Some(' ')));
 
