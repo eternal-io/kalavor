@@ -1,9 +1,11 @@
-use simdutf8::compat::from_utf8;
+use simdutf8::compat::{from_utf8, Utf8Error};
 use std::{
     io::{Error, ErrorKind, Read, Result},
-    ops::{Bound, RangeBounds},
+    mem,
+    ops::Range,
     ptr,
     result::Result as StdResult,
+    str::from_utf8_unchecked,
 };
 
 #[macro_use]
@@ -11,49 +13,96 @@ mod predicates;
 
 pub use predicates::*;
 
-pub struct Utf8Reader<R: Read> {
-    src: R,
-    buf: Vec<u8>,
-    buf_cap: usize,
-    tot_read: usize,
-    tot_consumed: usize,
+pub struct Utf8Reader<'src, R: Read> {
+    src: Source<'src, R>,
     off_consumed: usize,
-    off_valid: usize,
-    off_raw: usize,
+    tot_consumed: usize,
     peeked: Option<u8>,
     eof: bool,
 }
 
-impl<R: Read> Utf8Reader<R> {
-    pub const INIT_CAP: usize = 16 * 1024;
-    pub const GROW_CAP: usize = 16 * 1024;
-    const THRES_SHRINK: usize = 2 * 1024;
-    const THRES_EXTEND: usize = 4 * 1024;
+enum Source<'src, R: Read> {
+    Borrowed(&'src str),
+    Reader {
+        rdr: R,
+        buf: Box<[u8]>,
+        buf_cap: usize,
+        tot_read: usize,
+        off_read: usize,
+        off_valid: usize,
+    },
+}
 
-    #[allow(clippy::uninit_vec)]
-    pub fn new(src: R) -> Self {
+/// Uninhabited generic placeholder.
+enum __ {}
+
+impl Read for __ {
+    fn read(&mut self, _buf: &mut [u8]) -> Result<usize> {
+        unreachable!()
+    }
+}
+
+impl<'src> Utf8Reader<'src, __> {
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &'src str) -> Self {
         Self {
-            src,
-            buf: unsafe {
-                let mut buf = Vec::with_capacity(Self::INIT_CAP);
-                buf.set_len(Self::INIT_CAP);
-                buf
-            },
-            buf_cap: Self::INIT_CAP,
-            tot_read: 0,
-            tot_consumed: 0,
+            src: Source::Borrowed(s),
             off_consumed: 0,
-            off_valid: 0,
-            off_raw: 0,
+            tot_consumed: 0,
+            peeked: None,
+            eof: true,
+        }
+    }
+
+    pub fn from_bytes(bytes: &'src [u8]) -> StdResult<Self, Utf8Error> {
+        from_utf8(bytes).map(Self::from_str)
+    }
+}
+
+impl<R: Read> Utf8Reader<'static, R> {
+    pub fn from_reader(rdr: R) -> Self {
+        Self {
+            src: Source::Reader {
+                rdr,
+                buf: unsafe { Box::new_uninit_slice(Self::INIT_CAP).assume_init() },
+                buf_cap: Self::INIT_CAP,
+                tot_read: 0,
+                off_read: 0,
+                off_valid: 0,
+            },
+            off_consumed: 0,
+            tot_consumed: 0,
             peeked: None,
             eof: false,
         }
     }
+}
+
+impl<'src, R: Read> Utf8Reader<'src, R> {
+    pub const INIT_CAP: usize = 32 * 1024;
+    const THRES_ARRANGE: usize = 8 * 1024;
 
     /// Returns the string of unconsumed, valid UTF-8 bytes.
     #[inline]
     pub fn content(&self) -> &str {
-        unsafe { core::str::from_utf8_unchecked(self.buf.get_unchecked(self.off_consumed..self.off_valid)) }
+        unsafe {
+            match &self.src {
+                Source::Borrowed(s) => s.get_unchecked(self.off_consumed..),
+                Source::Reader { buf, off_valid, .. } => {
+                    from_utf8_unchecked(buf.get_unchecked(self.off_consumed..*off_valid))
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn content_behind(&self, span: Range<usize>) -> &str {
+        unsafe {
+            match &self.src {
+                Source::Borrowed(s) => s.get_unchecked(span),
+                Source::Reader { buf, .. } => from_utf8_unchecked(buf.get_unchecked(span)),
+            }
+        }
     }
 
     /// Marks the leading `n` bytes of the content as consumed, they will disappear in the future content.
@@ -76,51 +125,77 @@ impl<R: Read> Utf8Reader<R> {
 
     /// Returns `true` if encountered the EOF and all bytes are consumed.
     pub fn exhausted(&self) -> bool {
-        self.eof && self.off_consumed == self.off_valid
+        match &self.src {
+            Source::Borrowed(s) => self.off_consumed == s.len(),
+            Source::Reader { off_valid, .. } => self.eof && self.off_consumed == *off_valid,
+        }
     }
 
     //------------------------------------------------------------------------------
 
     /// Pulls no more than [`INIT_CAP`](Self::INIT_CAP) bytes.
     ///
-    /*  NOTE: The content may NOT be pinned. */
+    /*  WARN: The offset of content may NOT be pinned. */
     pub fn pull(&mut self) -> Result<()> {
-        if self.off_raw - self.off_consumed > Self::INIT_CAP {
+        let Source::Reader {
+            buf,
+            buf_cap,
+            off_read,
+            off_valid,
+            ..
+        } = &mut self.src
+        else {
             return Ok(());
-        } else if self.off_raw + Self::THRES_SHRINK > Self::INIT_CAP {
+        };
+
+        if *off_read > Self::INIT_CAP + self.off_consumed {
+            return Ok(());
+        }
+
+        if *off_read > Self::INIT_CAP - Self::THRES_ARRANGE {
             unsafe {
                 ptr::copy(
-                    self.buf.as_ptr().add(self.off_consumed),
-                    self.buf.as_ptr() as *mut _,
-                    self.off_raw - self.off_consumed,
-                )
+                    buf.as_ptr().add(self.off_consumed),
+                    buf.as_ptr() as *mut _,
+                    *off_read - self.off_consumed,
+                );
             }
 
             self.tot_consumed += self.off_consumed;
 
-            self.off_raw -= self.off_consumed;
-            self.off_valid -= self.off_consumed;
+            *off_valid -= self.off_consumed;
+            *off_read -= self.off_consumed;
+
             self.off_consumed = 0;
         }
 
-        self.buf_cap = Self::INIT_CAP;
-        unsafe { self.buf.set_len(self.buf_cap) }
+        *buf_cap = Self::INIT_CAP;
 
-        if self.off_raw >= Self::INIT_CAP {
+        if *off_read >= Self::INIT_CAP {
             return Ok(());
         }
 
         self.fetch(Self::pull)
     }
 
-    /// Pulls more bytes, allows the content to grow infinitely (at most [`GROW_CAP`](Self::GROW_CAP) bytes each call).
+    /// Pulls more bytes, allows the content to grow infinitely.
     ///
-    /*  NOTE: The content would be pinned. */
+    /*  NOTE: The offset of content would be pinned. */
     pub fn pull_more(&mut self) -> Result<()> {
-        if self.buf_cap - self.off_raw < Self::THRES_EXTEND {
-            self.buf.reserve(Self::GROW_CAP);
-            self.buf_cap += Self::GROW_CAP;
-            unsafe { self.buf.set_len(self.buf_cap) }
+        let Source::Reader {
+            buf, buf_cap, off_read, ..
+        } = &mut self.src
+        else {
+            return Ok(());
+        };
+
+        if *off_read > *buf_cap * 7 / 8 {
+            *buf_cap *= 2;
+            if *buf_cap > buf.len() {
+                let mut buf_new = unsafe { Box::new_uninit_slice(*buf_cap).assume_init() };
+                unsafe { ptr::copy_nonoverlapping(buf.as_ptr(), buf_new.as_mut_ptr(), *off_read) }
+                drop(mem::replace(buf, buf_new));
+            }
         }
 
         self.fetch(Self::pull_more)
@@ -130,10 +205,14 @@ impl<R: Read> Utf8Reader<R> {
     ///
     /// Returns `Ok(false)` if encountered the EOF, unable to read such more bytes.
     ///
-    /*  NOTE: The content would be pinned.  */
+    /*  NOTE: The offset of content would be pinned.  */
     pub fn pull_at_least(&mut self, n: usize) -> Result<bool> {
         loop {
-            match self.content().len() < n {
+            let Source::Reader { off_valid, .. } = &self.src else {
+                return Ok(self.content().len() >= n);
+            };
+
+            match self.off_consumed + n > *off_valid {
                 false => return Ok(true),
                 true => match !self.eof {
                     false => return Ok(false),
@@ -144,20 +223,31 @@ impl<R: Read> Utf8Reader<R> {
     }
 
     fn fetch(&mut self, rerun: fn(&mut Self) -> Result<()>) -> Result<()> {
-        let len = unsafe { self.src.read(self.buf.get_unchecked_mut(self.off_raw..self.buf_cap))? };
+        let Source::Reader {
+            rdr,
+            buf,
+            buf_cap,
+            tot_read,
+            off_read,
+            off_valid,
+        } = &mut self.src
+        else {
+            unreachable!()
+        };
+
+        let len = unsafe { rdr.read(buf.get_unchecked_mut(*off_read..*buf_cap))? };
 
         self.eof = len == 0;
 
         if !self.eof {
-            self.off_raw += len;
-            self.tot_read += len;
-
-            match self.validate()? > 0 {
+            *tot_read += len;
+            *off_read += len;
+            match self.validate()? {
                 true => Ok(()),
                 false => rerun(self),
             }
         } else {
-            match self.off_valid == self.off_raw {
+            match *off_valid == *off_read {
                 true => Ok(()),
                 false => Err(Error::new(
                     ErrorKind::UnexpectedEof,
@@ -167,21 +257,30 @@ impl<R: Read> Utf8Reader<R> {
         }
     }
 
-    fn validate(&mut self) -> Result<usize> {
-        let valid_len = match from_utf8(unsafe { self.buf.get_unchecked(self.off_valid..self.off_raw) }) {
-            Ok(s) => s.len(),
-            Err(e) => match e.error_len() {
-                None => e.valid_up_to(),
-                Some(n) => Err(Error::new(
-                    ErrorKind::InvalidData,
-                    format!("invalid UTF-8 bytes at index {}+{}", self.tot_read, n),
-                ))?,
-            },
+    fn validate(&mut self) -> Result<bool> {
+        let Source::Reader {
+            buf,
+            tot_read,
+            off_read,
+            off_valid,
+            ..
+        } = &mut self.src
+        else {
+            unreachable!()
         };
 
-        self.off_valid += valid_len;
-
-        Ok(valid_len)
+        if let Err(e) = unsafe { from_utf8(buf.get_unchecked(*off_valid..*off_read)) } {
+            match e.error_len() {
+                Some(n) => Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("invalid UTF-8 bytes at index {}+{}", tot_read, n),
+                )),
+                None => Ok(false),
+            }
+        } else {
+            *off_valid = *off_read;
+            Ok(true)
+        }
     }
 
     //------------------------------------------------------------------------------
@@ -191,9 +290,7 @@ impl<R: Read> Utf8Reader<R> {
     /// This method will automatically [`pull`](Self::pull) if the content is empty.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<char>> {
-        if self.content().is_empty() {
-            self.pull()?;
-        }
+        self.pull()?;
 
         Ok(self.content().chars().next().inspect(|ch| {
             self.off_consumed += ch.len_utf8();
@@ -204,14 +301,12 @@ impl<R: Read> Utf8Reader<R> {
     ///
     /// This method will automatically [`pull`](Self::pull) if the content is empty.
     pub fn peek(&mut self) -> Result<Option<char>> {
-        if self.content().is_empty() {
-            self.pull()?;
-        }
+        self.pull()?;
 
         Ok(self.content().chars().next())
     }
 
-    /// Consumes one character then peeks the second if the previous call is still [`peek_more`](Self::peek_more),
+    /// Consumes one character then peeks the second if the previous call is still [`peeking`](Self::peeking),
     /// peeks one character otherwise.
     ///
     /// This method will automatically [`pull_more`](Self::pull_more) if the content is insufficient.
@@ -265,7 +360,7 @@ impl<R: Read> Utf8Reader<R> {
     pub fn take_times<P, U>(&mut self, predicate: P, range: U) -> Result<(StdResult<&str, &str>, Option<char>)>
     where
         P: Predicate,
-        U: RangeBounds<usize>,
+        U: URangeBounds,
     {
         self.peeked = None;
 
@@ -274,26 +369,23 @@ impl<R: Read> Utf8Reader<R> {
         let ch = loop {
             match self.peeking()? {
                 None => break None,
-                Some(ch) => match match range.end_bound() {
-                    Bound::Included(&n) => times <= n,
-                    Bound::Excluded(&n) => times < n,
-                    Bound::Unbounded => true,
-                } && predicate.predicate(ch)
-                {
+                Some(ch) => match range.want_more(times) && predicate.predicate(ch) {
                     false => break Some(ch),
                     true => times += 1,
                 },
             }
         };
 
-        let span = unsafe { core::str::from_utf8_unchecked(self.buf.get_unchecked(start..self.off_consumed)) };
+        let span = start..self.off_consumed;
 
         Ok((
-            range
-                .contains(&times)
-                .then_some(span)
-                .ok_or(span)
-                .inspect_err(|_| self.off_consumed = start),
+            match range.contains(times) {
+                true => Ok(self.content_behind(span)),
+                false => {
+                    self.off_consumed = start;
+                    Err(self.content_behind(span))
+                }
+            },
             ch,
         ))
     }
@@ -320,24 +412,21 @@ impl<R: Read> Utf8Reader<R> {
             }
         };
 
-        Ok((
-            unsafe { core::str::from_utf8_unchecked(self.buf.get_unchecked(start..self.off_consumed)) },
-            ch,
-        ))
+        Ok((self.content_behind(start..self.off_consumed), ch))
     }
 
-    /// Consumes N characters if matched `pattern`.
+    /// Consumes K characters if matched `pattern`.
     ///
     /// Returns `Ok(None)` and doesn't consume if did't match anything.
     ///
     /// This method will automatically [`pull`](Self::pull) if the content is insufficient.
-    pub fn matches<P>(&mut self, pattern: P) -> Result<Option<P::Index>>
+    pub fn matches<P>(&mut self, pattern: P) -> Result<Option<P::Discriminant>>
     where
         P: Pattern,
     {
         self.pull()?;
 
-        Ok(match self.buf.first() {
+        Ok(match self.content().as_bytes().first() {
             None => None,
             Some(&b) => match pattern.indicate(b) {
                 None => None,
@@ -362,7 +451,7 @@ impl<R: Read> Utf8Reader<R> {
     /// Returns `Ok(Err(&str))` and doesn't consume if encountered the EOF.
     ///
     /// This method will automatically [`pull_more`](Self::pull_more) if the content is insufficient.
-    pub fn until<P>(&mut self, pattern: P) -> Result<StdResult<(&str, P::Index), &str>>
+    pub fn until<P>(&mut self, pattern: P) -> Result<StdResult<(&str, P::Discriminant), &str>>
     where
         P: Pattern,
     {
@@ -377,12 +466,12 @@ impl<R: Read> Utf8Reader<R> {
                     .enumerate()
                     .find_map(|(idx, &b)| pattern.indicate(b).map(|len| (idx, len)))
                 {
-                    None if self.eof => {
-                        break 'outer;
-                    }
                     None => {
                         self.off_consumed += self.content().len();
-                        self.pull_more()?;
+                        match !self.eof {
+                            false => break 'outer,
+                            true => self.pull_more()?,
+                        }
                     }
                     Some((idx, len)) => {
                         self.off_consumed += idx;
@@ -394,21 +483,19 @@ impl<R: Read> Utf8Reader<R> {
             self.pull_at_least(len)?;
 
             if let Some((len, idx)) = pattern.matches(self.content()) {
-                let span = unsafe { core::str::from_utf8_unchecked(self.buf.get_unchecked(start..self.off_consumed)) };
-
+                let span = start..self.off_consumed;
                 self.off_consumed += len;
 
-                return Ok(Ok((span, idx)));
+                return Ok(Ok((self.content_behind(span), idx)));
             }
 
             self.off_consumed += 1;
         }
 
-        let span = unsafe { core::str::from_utf8_unchecked(self.buf.get_unchecked(start..self.off_valid)) };
-
+        let span = start..self.off_consumed;
         self.off_consumed = start;
 
-        Ok(Err(span))
+        Ok(Err(self.content_behind(span)))
     }
 }
 
@@ -418,8 +505,7 @@ mod tests {
 
     #[test]
     fn scan() -> Result<()> {
-        let msg = " >< Foo >< Bar >< Baz >< ";
-        let mut rdr = Utf8Reader::new(msg.as_bytes());
+        let mut rdr = Utf8Reader::from_str(" >< Foo >< Bar >< Baz >< ");
 
         let separator = |ch| matches!(ch, ' ' | '>' | '<');
 
@@ -427,9 +513,10 @@ mod tests {
         assert_eq!(rdr.take_while(alphabetic)?, ("Foo", Some(' ')));
 
         assert_eq!(rdr.take_while(not!(separator))?, ("", Some(' ')));
+        assert_eq!(rdr.take_while(not!(separator, 'b'))?, ("", Some(' ')));
 
         assert_eq!(rdr.until("<>")?, Err(" >< Bar >< Baz >< "));
-        assert_eq!(rdr.until(["Foo", "Bar"])?, Ok((" >< ", 1)));
+        assert_eq!(rdr.until(["Foo", "Bar"])?, Ok((" >< ", "Bar")));
 
         Ok(())
     }
