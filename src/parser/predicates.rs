@@ -59,9 +59,9 @@ impl Predicate for char {
         ch == *self
     }
 }
-impl Predicate for &str {
+impl<'a> Predicate for &'a [char] {
     fn predicate(&self, ch: char) -> bool {
-        self.contains(ch)
+        self.contains(&ch)
     }
 }
 impl<const N: usize> Predicate for [char; N] {
@@ -82,72 +82,32 @@ impl Predicate for RangeInclusive<char> {
 
 //------------------------------------------------------------------------------
 
-#[inline(always)]
-const fn utf8_first_byte(ch: char) -> u8 {
-    let code = ch as u32;
-    match ch.len_utf8() {
-        1 => ch as u8,
-        2 => (code >> 6 & 0x1F) as u8 | 0b1100_0000,
-        3 => (code >> 12 & 0x0F) as u8 | 0b1110_0000,
-        4 => (code >> 18 & 0x07) as u8 | 0b1111_0000,
-        _ => unreachable!(),
-    }
-}
-
 /// Trait that matches a set of strings.
 pub trait Pattern {
     type Discriminant;
 
-    /// Returns the max length of the possible sub-patterns.
+    /// Returns the max length of possible sub-patterns.
     fn indicate(&self, begin: u8) -> Option<usize>;
 
-    /// Returns the length of the matched sub-pattern, and the index of the sub-pattern.
+    /// Returns the length of the matched sub-pattern in bytes,
+    /// and the discriminant of the sub-pattern.
     fn matches(&self, content: &str) -> Option<(usize, Self::Discriminant)>;
 }
 
-impl Pattern for char {
-    type Discriminant = Self;
-
-    fn indicate(&self, begin: u8) -> Option<usize> {
-        (utf8_first_byte(*self) == begin).then_some(self.len_utf8())
-    }
-
-    fn matches(&self, content: &str) -> Option<(usize, Self::Discriminant)> {
-        content.starts_with(*self).then_some((self.len_utf8(), *self))
-    }
-}
-
-impl Pattern for &str {
-    type Discriminant = Self;
+impl<'a> Pattern for &'a str {
+    type Discriminant = &'a str;
 
     fn indicate(&self, begin: u8) -> Option<usize> {
         self.as_bytes()
             .first()
             .and_then(|&b| (b == begin).then_some(self.len()))
     }
-
     fn matches(&self, content: &str) -> Option<(usize, Self::Discriminant)> {
         content.starts_with(self).then_some((self.len(), self))
     }
 }
 
-impl<const N: usize> Pattern for [char; N] {
-    type Discriminant = char;
-
-    fn indicate(&self, begin: u8) -> Option<usize> {
-        self.iter()
-            .filter_map(|&ch| (utf8_first_byte(ch) == begin).then_some(ch.len_utf8()))
-            .max()
-    }
-
-    fn matches(&self, content: &str) -> Option<(usize, Self::Discriminant)> {
-        self.iter()
-            .find(|&&ch| content.starts_with(ch))
-            .map(|&i| (i.len_utf8(), i))
-    }
-}
-
-impl<'a, const N: usize> Pattern for [&'a str; N] {
+impl<'z, 'a> Pattern for &'z [&'a str] {
     type Discriminant = &'a str;
 
     fn indicate(&self, begin: u8) -> Option<usize> {
@@ -155,9 +115,19 @@ impl<'a, const N: usize> Pattern for [&'a str; N] {
             .filter_map(|s| s.as_bytes().first().and_then(|&b| (b == begin).then_some(s.len())))
             .max()
     }
-
     fn matches(&self, content: &str) -> Option<(usize, Self::Discriminant)> {
         self.iter().find(|&&s| content.starts_with(s)).map(|&i| (i.len(), i))
+    }
+}
+
+impl<'a, const N: usize> Pattern for [&'a str; N] {
+    type Discriminant = &'a str;
+
+    fn indicate(&self, begin: u8) -> Option<usize> {
+        self.as_ref().indicate(begin)
+    }
+    fn matches(&self, content: &str) -> Option<(usize, Self::Discriminant)> {
+        self.as_ref().matches(content)
     }
 }
 
@@ -195,45 +165,51 @@ macro_rules! not {
     };
 }
 
-/// *(parser)* Implement [`Pattern`] for enumerations of a set of tokens conveniently.
+/// *(parser)* Generate structures, implement [`Pattern`] for a set of tokens conveniently.
 #[macro_export]
-macro_rules! token_sets {
+macro_rules! token_set {
     ( $(
         $(#[$attr:meta])*
-        $vis:vis enum $name:ident {
-            $($key:ident = $word:literal),+
-            $(,)?
-        }
-    )* ) => { $(
+        $name:ident { $(
+            $(#[$bttr:meta])*
+            $key:ident = $word:literal;
+        )* }
+    )* ) => { paste::paste! { $(
         $(#[$attr])*
-        $vis enum $name { $(
-            #[doc = concat!("Token ``````` ", $word, " ```````")]
+        #[doc = "\n\n*(generated token discriminant)*"]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub enum [<$name Token>] { $(
+            #[doc = concat!("Associates `", stringify!($word), "`.\n\n")]
+            $(#[$bttr])*
             $key,
-        )+ }
+        )* }
 
-        impl $name {
-            pub const fn len(&self) -> usize {
-                self.text().len()
-            }
-
-            pub const fn text(&self) -> &'static str {
-                match self { $(
-                    Self::$key => $word,
-                )+ }
+        impl [<$name Token>] {
+            /// Returns the associated text.
+            #[allow(dead_code, unreachable_patterns)]
+            pub fn text(&self) -> &'static str {
+                match self {
+                    $( Self::$key => token_set!( @ $word ), )*
+                    _ => unreachable!(),
+                }
             }
         }
 
-        impl Pattern for $name {
-            type Discriminant = Self;
+        #[doc = "Generated tokens pattern with [`" [<$name Token>] "`] discriminant."
+                "\n\nZST type by [`token_set!`] macro, only for passing as argument."]
+        pub(crate) struct [<$name Tokens>];
+
+        impl Pattern for [<$name Tokens>] {
+            type Discriminant = [<$name Token>];
 
             #[allow(unused_variables, unused_mut)]
             fn indicate(&self, begin: u8) -> Option<usize> {
                 let mut max_len = 0usize;
             $(
-                if $word.as_bytes()[0] == begin && $word.len() > max_len {
+                if begin == $word.as_bytes()[0] && $word.len() > max_len {
                     max_len = $word.len();
                 }
-            )+
+            )*
                 (max_len != 0).then_some(max_len)
             }
 
@@ -241,13 +217,17 @@ macro_rules! token_sets {
             fn matches(&self, content: &str) -> Option<(usize, Self::Discriminant)> {
             $(
                 if content.starts_with($word) {
-                    return Some(($word.len(), Self::$key))
+                    return Some(($word.len(), Self::Discriminant::$key))
                 }
-            )+
+            )*
                 None
             }
         }
-    )* };
+    )* } };
+
+    ( @ "" ) => { compile_error!("the associated text must be non-empty string") };
+
+    ( @ $word:literal ) => { $word };
 }
 
 //==================================================================================================
@@ -258,7 +238,7 @@ pub const fn any(ch: char) -> bool {
     true
 }
 
-/// ASCII newline.
+/// ASCII newline `\n`.
 pub const fn newline(ch: char) -> bool {
     ch == '\n'
 }
@@ -275,28 +255,28 @@ pub const fn whitespace(ch: char) -> bool {
 pub const fn ascii(ch: char) -> bool {
     ch.is_ascii()
 }
-/// ASCII alphabetic.
+/// ASCII alphabetic `[A-Za-z]`.
 pub const fn alphabetic(ch: char) -> bool {
     ch.is_ascii_alphabetic()
 }
-/// ASCII alphanumeric.
+/// ASCII alphanumeric `[0-9A-Za-z]`.
 pub const fn alphanumeric(ch: char) -> bool {
     ch.is_ascii_alphanumeric()
 }
 
-/// ASCII decimal digit.
+/// ASCII decimal digit `[0-9]`.
 pub const fn digit(ch: char) -> bool {
     ch.is_ascii_digit()
 }
-/// ASCII hexadecimal digit.
+/// ASCII hexadecimal digit `[0-9A-Fa-f]`.
 pub const fn hexdigit(ch: char) -> bool {
     ch.is_ascii_hexdigit()
 }
-/// ASCII octal digit.
+/// ASCII octal digit `[0-7]`.
 pub const fn octdigit(ch: char) -> bool {
     matches!(ch, '0'..='7')
 }
-/// ASCII binary digit.
+/// ASCII binary digit `[0-1]`.
 pub const fn bindigit(ch: char) -> bool {
     matches!(ch, '0' | '1')
 }

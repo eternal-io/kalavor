@@ -1,10 +1,9 @@
 use simdutf8::compat::{from_utf8, Utf8Error};
 use std::{
-    io::{Error, ErrorKind, Read, Result},
+    io::{self, Error, ErrorKind, Read},
     mem,
     ops::Range,
     ptr,
-    result::Result as StdResult,
     str::from_utf8_unchecked,
 };
 
@@ -12,6 +11,9 @@ use std::{
 mod predicates;
 
 pub use predicates::*;
+
+#[cfg(test)]
+mod tests;
 
 pub struct Utf8Reader<'src, R: Read> {
     src: Source<'src, R>,
@@ -22,7 +24,9 @@ pub struct Utf8Reader<'src, R: Read> {
 }
 
 enum Source<'src, R: Read> {
-    Borrowed(&'src str),
+    Borrowed {
+        slice: &'src str,
+    },
     Reader {
         rdr: R,
         buf: Box<[u8]>,
@@ -34,19 +38,19 @@ enum Source<'src, R: Read> {
 }
 
 /// Uninhabited generic placeholder.
-enum __ {}
+enum Slice {}
 
-impl Read for __ {
-    fn read(&mut self, _buf: &mut [u8]) -> Result<usize> {
+impl Read for Slice {
+    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
         unreachable!()
     }
 }
 
-impl<'src> Utf8Reader<'src, __> {
+impl<'src> Utf8Reader<'src, Slice> {
     #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &'src str) -> Self {
+    pub fn from_str(slice: &'src str) -> Self {
         Self {
-            src: Source::Borrowed(s),
+            src: Source::Borrowed { slice },
             off_consumed: 0,
             tot_consumed: 0,
             peeked: None,
@@ -54,7 +58,7 @@ impl<'src> Utf8Reader<'src, __> {
         }
     }
 
-    pub fn from_bytes(bytes: &'src [u8]) -> StdResult<Self, Utf8Error> {
+    pub fn from_bytes(bytes: &'src [u8]) -> Result<Self, Utf8Error> {
         from_utf8(bytes).map(Self::from_str)
     }
 }
@@ -79,15 +83,15 @@ impl<R: Read> Utf8Reader<'static, R> {
 }
 
 impl<'src, R: Read> Utf8Reader<'src, R> {
-    pub const INIT_CAP: usize = 32 * 1024;
-    const THRES_ARRANGE: usize = 8 * 1024;
+    const INIT_CAP: usize = 32 * 1024;
+    const THRES_REARRANGE: usize = 8 * 1024;
 
-    /// Returns the string of unconsumed, valid UTF-8 bytes.
+    /// Returns the slice of unconsumed, valid UTF-8 bytes.
     #[inline]
     pub fn content(&self) -> &str {
         unsafe {
             match &self.src {
-                Source::Borrowed(s) => s.get_unchecked(self.off_consumed..),
+                Source::Borrowed { slice } => slice.get_unchecked(self.off_consumed..),
                 Source::Reader { buf, off_valid, .. } => {
                     from_utf8_unchecked(buf.get_unchecked(self.off_consumed..*off_valid))
                 }
@@ -99,7 +103,7 @@ impl<'src, R: Read> Utf8Reader<'src, R> {
     fn content_behind(&self, span: Range<usize>) -> &str {
         unsafe {
             match &self.src {
-                Source::Borrowed(s) => s.get_unchecked(span),
+                Source::Borrowed { slice } => slice.get_unchecked(span),
                 Source::Reader { buf, .. } => from_utf8_unchecked(buf.get_unchecked(span)),
             }
         }
@@ -110,7 +114,7 @@ impl<'src, R: Read> Utf8Reader<'src, R> {
     /// # Panics
     ///
     /// Panics if the `n`th byte is not at a UTF-8 character boundary.
-    pub fn consume(&mut self, n: usize) {
+    pub fn bump(&mut self, n: usize) {
         if !self.content().is_char_boundary(n) {
             panic!("{} is not at a UTF-8 character boundary", n)
         }
@@ -123,20 +127,20 @@ impl<'src, R: Read> Utf8Reader<'src, R> {
         self.tot_consumed + self.off_consumed
     }
 
-    /// Returns `true` if encountered the EOF and all bytes are consumed.
+    /// Returns `true` if all bytes are consumed and encountered the EOF.
     pub fn exhausted(&self) -> bool {
         match &self.src {
-            Source::Borrowed(s) => self.off_consumed == s.len(),
+            Source::Borrowed { slice } => self.off_consumed == slice.len(),
             Source::Reader { off_valid, .. } => self.eof && self.off_consumed == *off_valid,
         }
     }
 
     //------------------------------------------------------------------------------
 
-    /// Pulls no more than [`INIT_CAP`](Self::INIT_CAP) bytes.
+    /// Pull bytes if available content is less than 8 KiB.
     ///
     /*  WARN: The offset of content may NOT be pinned. */
-    pub fn pull(&mut self) -> Result<()> {
+    pub fn pull(&mut self) -> io::Result<()> {
         let Source::Reader {
             buf,
             buf_cap,
@@ -148,13 +152,35 @@ impl<'src, R: Read> Utf8Reader<'src, R> {
             return Ok(());
         };
 
-        if *off_read > Self::INIT_CAP + self.off_consumed {
+        /**************************************************************************************************
+         *            THRES_REARRANGE       INIT_CAP                                                      *
+         *                          ↓       ↓                                                             *
+         *  +-------+-------+-------+-------+                                                             *
+         *  |       |       |       |<<<<<<<| buffer                                                      *
+         *  +-------+-------+-------+-------+                                                             *
+         *                          '                                                                     *
+         *                         ^~~~~~~~~$ Next first `if` captured (`content().len() > THRES`),       *
+         *                          '         the span can be shifted/expanded arbitrary.                 *
+         *                          '                                                                     *
+         *                     ^~~~~'~~$      Next second `if` captured (`content().len() <= THRES`),     *
+         *                    ^~~~~~'~$       it's guaranteed no overlap to rearrange the buffer,         *
+         *                   ^~~~~~~'$        and `buf_cap` can reset safely.                             *
+         *                          '                                                                     *
+         *                  ^~~~~~~~$         <- "worst" case.                                            *
+         *                         X'                                                                     *
+         *                          '                                                                     *
+         *  ^~~~~~~~$               '         After rearrangement.                                        *
+         *                                                                                                *
+         *  where the span is `off_consumed..off_read`.                                                   *
+         **************************************************************************************************/
+
+        if *off_read - self.off_consumed > Self::THRES_REARRANGE {
             return Ok(());
         }
 
-        if *off_read > Self::INIT_CAP - Self::THRES_ARRANGE {
+        if *off_read >= Self::INIT_CAP - Self::THRES_REARRANGE {
             unsafe {
-                ptr::copy(
+                ptr::copy_nonoverlapping(
                     buf.as_ptr().add(self.off_consumed),
                     buf.as_ptr() as *mut _,
                     *off_read - self.off_consumed,
@@ -167,21 +193,17 @@ impl<'src, R: Read> Utf8Reader<'src, R> {
             *off_read -= self.off_consumed;
 
             self.off_consumed = 0;
-        }
 
-        *buf_cap = Self::INIT_CAP;
-
-        if *off_read >= Self::INIT_CAP {
-            return Ok(());
+            *buf_cap = Self::INIT_CAP;
         }
 
         self.fetch(Self::pull)
     }
 
-    /// Pulls more bytes, allows the content to grow infinitely.
+    /// Pull more bytes, allows the content to grow infinitely.
     ///
     /*  NOTE: The offset of content would be pinned. */
-    pub fn pull_more(&mut self) -> Result<()> {
+    pub fn pull_more(&mut self) -> io::Result<()> {
         let Source::Reader {
             buf, buf_cap, off_read, ..
         } = &mut self.src
@@ -189,8 +211,12 @@ impl<'src, R: Read> Utf8Reader<'src, R> {
             return Ok(());
         };
 
-        if *off_read > *buf_cap * 7 / 8 {
-            *buf_cap *= 2;
+        fn m7d8(n: usize) -> usize {
+            (n >> 1) + (n >> 2) + (n >> 3)
+        }
+
+        if *off_read > m7d8(*buf_cap) {
+            *buf_cap <<= 1;
             if *buf_cap > buf.len() {
                 let mut buf_new = unsafe { Box::new_uninit_slice(*buf_cap).assume_init() };
                 unsafe { ptr::copy_nonoverlapping(buf.as_ptr(), buf_new.as_mut_ptr(), *off_read) }
@@ -201,12 +227,12 @@ impl<'src, R: Read> Utf8Reader<'src, R> {
         self.fetch(Self::pull_more)
     }
 
-    /// Pulls more bytes, makes the content has at least `n` bytes.
+    /// Pull more bytes, makes the content has at least `n` bytes.
     ///
     /// Returns `Ok(false)` if encountered the EOF, unable to read such more bytes.
     ///
     /*  NOTE: The offset of content would be pinned.  */
-    pub fn pull_at_least(&mut self, n: usize) -> Result<bool> {
+    pub fn pull_at_least(&mut self, n: usize) -> io::Result<bool> {
         loop {
             let Source::Reader { off_valid, .. } = &self.src else {
                 return Ok(self.content().len() >= n);
@@ -222,7 +248,7 @@ impl<'src, R: Read> Utf8Reader<'src, R> {
         }
     }
 
-    fn fetch(&mut self, rerun: fn(&mut Self) -> Result<()>) -> Result<()> {
+    fn fetch(&mut self, rerun: fn(&mut Self) -> io::Result<()>) -> io::Result<()> {
         let Source::Reader {
             rdr,
             buf,
@@ -251,13 +277,13 @@ impl<'src, R: Read> Utf8Reader<'src, R> {
                 true => Ok(()),
                 false => Err(Error::new(
                     ErrorKind::UnexpectedEof,
-                    "incomplete UTF-8 code point at the end",
+                    format!("incomplete UTF-8 code point at the end ({})", *off_valid),
                 )),
             }
         }
     }
 
-    fn validate(&mut self) -> Result<bool> {
+    fn validate(&mut self) -> io::Result<bool> {
         let Source::Reader {
             buf,
             tot_read,
@@ -285,11 +311,11 @@ impl<'src, R: Read> Utf8Reader<'src, R> {
 
     //------------------------------------------------------------------------------
 
-    /// Consumes one character.
+    /// Consume one character.
     ///
     /// This method will automatically [`pull`](Self::pull) if the content is empty.
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Result<Option<char>> {
+    pub fn next(&mut self) -> io::Result<Option<char>> {
         self.pull()?;
 
         Ok(self.content().chars().next().inspect(|ch| {
@@ -300,13 +326,27 @@ impl<'src, R: Read> Utf8Reader<'src, R> {
     /// Peeks one character.
     ///
     /// This method will automatically [`pull`](Self::pull) if the content is empty.
-    pub fn peek(&mut self) -> Result<Option<char>> {
+    pub fn peek(&mut self) -> io::Result<Option<char>> {
         self.pull()?;
 
         Ok(self.content().chars().next())
     }
 
-    /// Consumes one character then peeks the second if the previous call is still [`peeking`](Self::peeking),
+    /// As same as the [`next`](Self::next), but [`pull_more`](Self::pull_more) instead.
+    ///
+    /** Private method because opaque and unpinned internal offsets. */
+    #[inline(always)]
+    fn nexting(&mut self) -> io::Result<Option<char>> {
+        if self.content().is_empty() {
+            self.pull_more()?;
+        }
+
+        Ok(self.content().chars().next().inspect(|ch| {
+            self.off_consumed += ch.len_utf8();
+        }))
+    }
+
+    /// Consume one character then peeks the second if the previous call is still [`peeking`](Self::peeking),
     /// peeks one character otherwise.
     ///
     /// This method will automatically [`pull_more`](Self::pull_more) if the content is insufficient.
@@ -315,7 +355,7 @@ impl<'src, R: Read> Utf8Reader<'src, R> {
     ///
     /** Private method because opaque and unpinned internal offsets. */
     #[inline(always)]
-    fn peeking(&mut self) -> Result<Option<char>> {
+    fn peeking(&mut self) -> io::Result<Option<char>> {
         if let Some(len) = self.peeked.take() {
             self.off_consumed += len as usize;
         }
@@ -331,10 +371,29 @@ impl<'src, R: Read> Utf8Reader<'src, R> {
 
     //------------------------------------------------------------------------------
 
-    /// Consumes one character if `predicate`.
+    /// Consume N characters.
+    ///
+    /// Returns `Ok(Err(_))` if encountered the EOF.
+    ///
+    /// This method will automatically [`pull_more`](Self::pull_more) if the content is insufficient.
+    pub fn take(&mut self, n_char: usize) -> io::Result<Result<&str, &str>> {
+        let start = self.off_consumed;
+
+        for _ in 0..n_char {
+            if self.nexting()?.is_none() {
+                return Ok(Err(self.content_behind(start..self.off_consumed)));
+            }
+        }
+
+        Ok(Ok(self.content_behind(start..self.off_consumed)))
+    }
+
+    /// Consume one character if `predicate`.
+    ///
+    /// Returns `Ok(None)` if encountered the EOF.
     ///
     /// This method will automatically [`pull`](Self::pull) if the content is empty.
-    pub fn take_once<P>(&mut self, predicate: P) -> Result<Option<char>>
+    pub fn take_once<P>(&mut self, predicate: P) -> io::Result<Option<char>>
     where
         P: Predicate,
     {
@@ -350,14 +409,19 @@ impl<'src, R: Read> Utf8Reader<'src, R> {
         })
     }
 
-    /// Consumes N..M characters consisting of `predicate`.
+    /// Consume N..M characters consisting of `predicate`.
     ///
     /// Peeks the first unexpected character additionally, may be `None` if encountered the EOF.
     ///
-    /// Returns `Ok((Err(&str), _))` and doesn't consume if the taking times not in `range`.
+    /// Returns `Ok(Err(_))` and doesn't consume if the taking times not in `range`.
     ///
     /// This method will automatically [`pull_more`](Self::pull_more) if the content is insufficient.
-    pub fn take_times<P, U>(&mut self, predicate: P, range: U) -> Result<(StdResult<&str, &str>, Option<char>)>
+    #[allow(clippy::type_complexity)]
+    pub fn take_times<P, U>(
+        &mut self,
+        predicate: P,
+        range: U,
+    ) -> io::Result<Result<(&str, Option<char>), (&str, Option<char>)>>
     where
         P: Predicate,
         U: URangeBounds,
@@ -378,24 +442,21 @@ impl<'src, R: Read> Utf8Reader<'src, R> {
 
         let span = start..self.off_consumed;
 
-        Ok((
-            match range.contains(times) {
-                true => Ok(self.content_behind(span)),
-                false => {
-                    self.off_consumed = start;
-                    Err(self.content_behind(span))
-                }
-            },
-            ch,
-        ))
+        Ok(match range.contains(times) {
+            true => Ok((self.content_behind(span), ch)),
+            false => {
+                self.off_consumed = start;
+                Err((self.content_behind(span), ch))
+            }
+        })
     }
 
-    /// Consumes X characters consisting of `predicate`.
+    /// Consume X characters consisting of `predicate`.
     ///
     /// Peeks the first unexpected character additionally, may be `None` if encountered the EOF.
     ///
     /// This method will automatically [`pull_more`](Self::pull_more) if the content is insufficient.
-    pub fn take_while<P>(&mut self, predicate: P) -> Result<(&str, Option<char>)>
+    pub fn take_while<P>(&mut self, predicate: P) -> io::Result<(&str, Option<char>)>
     where
         P: Predicate,
     {
@@ -415,12 +476,12 @@ impl<'src, R: Read> Utf8Reader<'src, R> {
         Ok((self.content_behind(start..self.off_consumed), ch))
     }
 
-    /// Consumes K characters if matched `pattern`.
+    /// Consume K characters if matched `pattern`.
     ///
     /// Returns `Ok(None)` and doesn't consume if did't match anything.
     ///
     /// This method will automatically [`pull`](Self::pull) if the content is insufficient.
-    pub fn matches<P>(&mut self, pattern: P) -> Result<Option<P::Discriminant>>
+    pub fn matches<P>(&mut self, pattern: P) -> io::Result<Option<P::Discriminant>>
     where
         P: Pattern,
     {
@@ -444,20 +505,51 @@ impl<'src, R: Read> Utf8Reader<'src, R> {
         })
     }
 
-    /// Consumes X characters until matched `pattern`.
+    /// Consume X characters until encountered `predicate`.
+    ///
+    /// The `predicate` is excluded from the result and also marked as consumed.
+    ///
+    /// Returns `Ok(Err(_))` and doesn't consume if encountered the EOF.
+    ///
+    /// This method will automatically [`pull_more`](Self::pull_more) if the content is insufficient.
+    pub fn skim_till<P>(&mut self, predicate: P) -> io::Result<Result<(&str, char), &str>>
+    where
+        P: Predicate,
+    {
+        self.peeked = None;
+
+        let start = self.off_consumed;
+        let ch = loop {
+            match self.peeking()? {
+                None => break None,
+                Some(ch) => match !predicate.predicate(ch) {
+                    false => break Some(ch),
+                    true => continue,
+                },
+            }
+        };
+
+        let spanned = self.content_behind(start..self.off_consumed);
+
+        Ok(match ch {
+            Some(ch) => Ok((spanned, ch)),
+            None => Err(spanned),
+        })
+    }
+
+    /// Consume X characters until encountered `pattern`.
     ///
     /// The `pattern` is excluded from the result and also marked as consumed.
     ///
-    /// Returns `Ok(Err(&str))` and doesn't consume if encountered the EOF.
+    /// Returns `Ok(Err(_))` and doesn't consume if encountered the EOF.
     ///
     /// This method will automatically [`pull_more`](Self::pull_more) if the content is insufficient.
-    pub fn until<P>(&mut self, pattern: P) -> Result<StdResult<(&str, P::Discriminant), &str>>
+    pub fn skim_until<P>(&mut self, pattern: P) -> io::Result<Result<(&str, P::Discriminant), &str>>
     where
         P: Pattern,
     {
         let start = self.off_consumed;
-
-        'outer: loop {
+        let (span, discr) = 'outer: loop {
             let len = loop {
                 match self
                     .content()
@@ -469,7 +561,7 @@ impl<'src, R: Read> Utf8Reader<'src, R> {
                     None => {
                         self.off_consumed += self.content().len();
                         match !self.eof {
-                            false => break 'outer,
+                            false => break 'outer (start..self.off_consumed, None),
                             true => self.pull_more()?,
                         }
                     }
@@ -482,42 +574,82 @@ impl<'src, R: Read> Utf8Reader<'src, R> {
 
             self.pull_at_least(len)?;
 
-            if let Some((len, idx)) = pattern.matches(self.content()) {
+            if let Some((len, discr)) = pattern.matches(self.content()) {
                 let span = start..self.off_consumed;
                 self.off_consumed += len;
-
-                return Ok(Ok((self.content_behind(span), idx)));
+                break (span, Some(discr));
             }
 
             self.off_consumed += 1;
-        }
+        };
 
-        let span = start..self.off_consumed;
-        self.off_consumed = start;
-
-        Ok(Err(self.content_behind(span)))
+        Ok(match discr {
+            Some(discr) => Ok((self.content_behind(span), discr)),
+            None => {
+                self.off_consumed = start;
+                Err(self.content_behind(span))
+            }
+        })
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    /// Deprecate X characters until encountered `predicate`.
+    ///
+    /// Peeks the first encountered character additionally, may be `None` if encountered the EOF.
+    pub fn skip_till<P>(&mut self, predicate: P) -> io::Result<Option<char>>
+    where
+        P: Predicate,
+    {
+        self.peeked = None;
 
-    #[test]
-    fn scan() -> Result<()> {
-        let mut rdr = Utf8Reader::from_str(" >< Foo >< Bar >< Baz >< ");
+        Ok(loop {
+            match self.peeking()? {
+                None => break None,
+                Some(ch) => match !predicate.predicate(ch) {
+                    false => break Some(ch),
+                    true => continue,
+                },
+            }
+        })
+    }
 
-        let separator = |ch| matches!(ch, ' ' | '>' | '<');
+    /// Deprecate X characters until encountered `pattern`.
+    ///
+    /// Peeks the first encountered sub-pattern additionally, may be `None` if encountered the EOF.
+    pub fn skip_until<P>(&mut self, pattern: P) -> io::Result<Option<P::Discriminant>>
+    where
+        P: Pattern,
+    {
+        Ok('outer: loop {
+            let len = loop {
+                match self
+                    .content()
+                    .as_bytes()
+                    .iter()
+                    .enumerate()
+                    .find_map(|(idx, &b)| pattern.indicate(b).map(|len| (idx, len)))
+                {
+                    None => {
+                        self.off_consumed += self.content().len();
+                        match !self.eof {
+                            false => break 'outer None,
+                            true => self.pull_more()?,
+                        }
+                    }
+                    Some((idx, len)) => {
+                        self.off_consumed += idx;
+                        break len;
+                    }
+                }
+            };
 
-        assert_eq!(rdr.take_while(separator)?, (" >< ", Some('F')));
-        assert_eq!(rdr.take_while(alphabetic)?, ("Foo", Some(' ')));
+            self.pull_at_least(len)?;
 
-        assert_eq!(rdr.take_while(not!(separator))?, ("", Some(' ')));
-        assert_eq!(rdr.take_while(not!(separator, 'b'))?, ("", Some(' ')));
+            if let Some((len, discr)) = pattern.matches(self.content()) {
+                self.off_consumed += len;
+                break Some(discr);
+            }
 
-        assert_eq!(rdr.until("<>")?, Err(" >< Bar >< Baz >< "));
-        assert_eq!(rdr.until(["Foo", "Bar"])?, Ok((" >< ", "Bar")));
-
-        Ok(())
+            self.off_consumed += 1;
+        })
     }
 }
