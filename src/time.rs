@@ -2,11 +2,17 @@
 //!
 //! This module has fully re-exported the [time] crate, provided convenience functions as listed below.
 
+extern crate alloc;
+
+use alloc::{boxed::Box, vec::Vec};
+
 pub use time::*;
 
+#[cfg(feature = "std")]
 pub fn now() -> Box<str> {
     of(OffsetDateTime::now_utc())
 }
+#[cfg(feature = "std")]
 pub fn now_precise() -> Box<str> {
     precise_of(OffsetDateTime::now_utc())
 }
@@ -73,7 +79,7 @@ fn format<const MICRO: bool>(dt: OffsetDateTime) -> Box<str> {
         out[20] = b'0' + low % 10;
     }
 
-    unsafe { std::str::from_boxed_utf8_unchecked(out.into_boxed_slice()) }
+    unsafe { alloc::str::from_boxed_utf8_unchecked(out.into_boxed_slice()) }
 }
 
 #[test]

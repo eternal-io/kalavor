@@ -15,13 +15,9 @@ keywords = ["flavored", "content"]
 categories = ["value-formatting", "text-processing"]
 
 [features]
-default = []
+default = ["std"]
+std = []
 time = ["dep:time"]
-parser = ["dep:simdutf8", "dep:paste"]
-parser-xid = ["parser", "dep:unicode-ident"]
 
 [dependencies]
-time = { version = "0.3.37", optional = true, default-features = false, features = ["std"] }
-paste = { version = "1.0.15", optional = true }
-simdutf8 = { version = "0.1.5", optional = true }
-unicode-ident = { version = "1.0.16", optional = true }
+time = { version = "0.3.37", optional = true }
