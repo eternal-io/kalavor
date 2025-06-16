@@ -4,7 +4,7 @@ version = "0.2.0-internal.a"
 edition = "2021"
 authors = ["K--Aethiax"]
 
-description = "K--Aethiax flavored contents, mainly for private use."
+description = "Basically a set of flavored formatters."
 
 documentation = "https://docs.rs/kalavor"
 repository = "https://github.com/eternal-io/kalavor"
