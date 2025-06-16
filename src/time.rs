@@ -33,8 +33,9 @@ fn format<const MICRO: bool>(dt: OffsetDateTime) -> Box<str> {
 
     /* A01123-0456-0789.0137 */
 
-    let cap = dt.year().is_positive();
-    let yy = (dt.year() - 2022).rem_euclid(200) as u8;
+    let year = dt.year() - 2022;
+    let cap = year.is_positive();
+    let yy = year.rem_euclid(200) as u8;
 
     let month = dt.month() as u8;
     let day = dt.day();
@@ -86,6 +87,16 @@ fn format<const MICRO: bool>(dt: OffsetDateTime) -> Box<str> {
 fn test() {
     dbg!(now());
     dbg!(now_precise());
+
+    assert_eq!(
+        of(OffsetDateTime::new_in_offset(
+            Date::from_calendar_date(2018, Month::August, 04).unwrap(),
+            Time::from_hms(01, 23, 0).unwrap(),
+            UtcOffset::from_whole_seconds(8 * 3600).unwrap(),
+        ))
+        .as_ref(),
+        "t60804-0123-0000"
+    );
 
     assert_eq!(
         precise_of(OffsetDateTime::new_in_offset(
